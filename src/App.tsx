@@ -195,6 +195,11 @@ function getFileName(path: string) {
   return path.split(/[\\/]/).pop() ?? path
 }
 
+async function dataUrlToBlob(dataUrl: string) {
+  const response = await fetch(dataUrl)
+  return response.blob()
+}
+
 function classifyPath(path: string): SourceKind | null {
   const ext = getExtension(path)
   if (ext === 'pdf') {
@@ -575,6 +580,7 @@ function App() {
   const pickFiles = async () => {
     const selected = await open({
       multiple: true,
+      directory: false,
       filters: [
         { name: 'PDF', extensions: ['pdf'] },
         { name: 'Images', extensions: imageExtensions },
@@ -758,6 +764,41 @@ function App() {
       setStatusText('已复制结果路径列表')
     } catch {
       setStatusText('复制失败，请检查系统剪贴板权限')
+    }
+  }
+
+  const copyPreviewImage = async () => {
+    if (!previewingOutput) {
+      setStatusText('当前没有正在预览的结果')
+      return
+    }
+
+    if (previewingOutput.kind !== 'image') {
+      setStatusText('当前结果不是图片，暂时不能直接复制图片本体')
+      return
+    }
+
+    const previewSrc = previewSrcMap[previewingOutput.id]
+    if (!previewSrc) {
+      setStatusText('当前图片预览还没准备好，稍后再试一次')
+      return
+    }
+
+    if (typeof navigator.clipboard?.write !== 'function' || typeof ClipboardItem === 'undefined') {
+      setStatusText('当前环境不支持直接复制图片到剪贴板')
+      return
+    }
+
+    try {
+      const blob = await dataUrlToBlob(previewSrc)
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          [blob.type || 'image/png']: blob,
+        }),
+      ])
+      setStatusText(`已复制图片：${previewingOutput.label}`)
+    } catch {
+      setStatusText('复制图片失败，请检查系统剪贴板权限')
     }
   }
 
@@ -1371,6 +1412,14 @@ function App() {
                   }}
                 >
                   放大
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button compact-button"
+                  disabled={previewingOutput.kind !== 'image' || !previewSrcMap[previewingOutput.id]}
+                  onClick={copyPreviewImage}
+                >
+                  复制图片
                 </button>
                 <span className="lightbox-counter">
                   {previewingIndex >= 0 ? `${previewingIndex + 1} / ${outputCards.length}` : `0 / ${outputCards.length}`}
