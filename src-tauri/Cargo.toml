@@ -1,0 +1,25 @@
+[package]
+name = "liteutools"
+version = "0.1.0"
+description = "LiteUtools desktop workspace"
+authors = ["empty"]
+edition = "2021"
+
+[lib]
+name = "liteutools_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+image = "0.25.10"
+pdfium-render = "0.9.1"
+printpdf = { version = "0.9.1", features = ["png", "jpeg", "bmp", "gif", "tiff", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"

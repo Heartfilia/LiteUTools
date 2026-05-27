@@ -1,0 +1,46 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependency directories
+node_modules
+
+# Frontend build outputs and caches
+dist
+dist-ssr
+.vite
+.cache
+.eslintcache
+coverage
+tmp
+temp
+*.tmp
+*.temp
+*.tsbuildinfo
+
+# Rust/Tauri build outputs and generated files
+src-tauri/target
+src-tauri/gen
+
+# Local environment overrides
+*.local
+.env
+.env.*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+**/.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.claude
