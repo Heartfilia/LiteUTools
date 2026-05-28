@@ -10,10 +10,6 @@
       <stop offset="0.48" stop-color="#ABE5FF"/>
       <stop offset="1" stop-color="#71CBFF"/>
     </linearGradient>
-    <linearGradient id="accentBottom" x1="66" y1="208" x2="126" y2="146" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#8EE5FF"/>
-      <stop offset="1" stop-color="#8EE5FF" stop-opacity="0"/>
-    </linearGradient>
     <filter id="glow" x="54" y="56" width="150" height="154" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
       <feFlood flood-opacity="0" result="BackgroundImageFix"/>
       <feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
@@ -21,13 +17,11 @@
     </filter>
   </defs>
 
-  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
-  <rect x="16" y="16" width="224" height="224" rx="44" stroke="#163246" stroke-opacity="0.9" stroke-width="2"/>
-  <circle cx="205" cy="51" r="5" fill="#BFE9FF"/>
-  <path d="M48 190V208H66" stroke="url(#accentBottom)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="18" y="18" width="220" height="220" rx="48" fill="url(#bg)"/>
+  <rect x="30" y="30" width="196" height="196" rx="36" stroke="#163246" stroke-opacity="0.9" stroke-width="2"/>
 
-  <g filter="url(#glow)" stroke="url(#fill)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M96 82V174H130"/>
-    <path d="M96 82V140C96 158.778 111.222 174 130 174C148.778 174 164 158.778 164 140V82"/>
+  <g filter="url(#glow)" stroke="url(#fill)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M101 90V168H133"/>
+    <path d="M101 90V138C101 154.569 114.431 168 131 168C147.569 168 161 154.569 161 138V90"/>
   </g>
 </svg>
