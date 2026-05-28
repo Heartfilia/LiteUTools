@@ -1,7 +1,7 @@
 {
   "name": "liteutools",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "pdfium:setup": "node scripts/setup-pdfium.mjs",
     "pdfium:check": "node scripts/setup-pdfium.mjs --check",
+    "version:sync": "node scripts/sync-version.mjs",
     "tauri:dev": "npm run pdfium:setup && tauri dev",
     "tauri:build": "npm run pdfium:setup && tauri build"
   },

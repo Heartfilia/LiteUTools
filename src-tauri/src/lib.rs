@@ -7,10 +7,12 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use clipboard_rs::{common::RustImage, Clipboard, ClipboardContext, RustImageData};
 use image::GenericImageView;
 use pdfium_render::prelude::*;
 use printpdf::{
-    Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, XObjectTransform,
+    ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions,
+    RawImage, XObjectTransform,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -311,6 +313,40 @@ fn load_preview_data(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn copy_image_to_clipboard(path: String) -> Result<(), String> {
+    let image_data =
+        RustImageData::from_path(&path).map_err(|error| format!("读取图片失败: {error}"))?;
+
+    let clipboard = ClipboardContext::new().map_err(|error| format!("打开剪贴板失败: {error}"))?;
+    clipboard
+        .set_image(image_data)
+        .map_err(|error| format!("写入图片剪贴板失败: {error}"))
+}
+
+#[tauri::command]
+fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("没有可复制的文件。".to_string());
+    }
+
+    let file_paths = paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    if file_paths.is_empty() {
+        return Err("没有找到可复制的文件。".to_string());
+    }
+
+    let clipboard = ClipboardContext::new().map_err(|error| format!("打开剪贴板失败: {error}"))?;
+    clipboard
+        .set_files(file_paths)
+        .map_err(|error| format!("写入文件剪贴板失败: {error}"))
+}
+
+#[tauri::command]
 fn resolve_import_paths(paths: Vec<String>) -> Result<Vec<ResolvedImport>, String> {
     let mut resolved = Vec::new();
 
@@ -494,6 +530,8 @@ fn convert_images_to_pdf(
     run_id: &str,
     params: ImagePdfParams,
 ) -> Result<ConversionResponse, String> {
+    const DEFAULT_IMAGE_PDF_DPI: f32 = 300.0;
+
     let output_root = workspace_dir.join("merged-pdf");
     fs::create_dir_all(&output_root).map_err(|error| format!("创建缓冲目录失败: {error}"))?;
     let output_path = unique_target_path(
@@ -552,8 +590,13 @@ fn convert_images_to_pdf(
             }
         };
 
-        let (page_width_mm, page_height_mm) =
-            resolve_page_size(dimensions.0, dimensions.1, &params.page_size, &params.orientation);
+        let (page_width_mm, page_height_mm) = resolve_page_size(
+            dimensions.0,
+            dimensions.1,
+            &params.page_size,
+            &params.orientation,
+            DEFAULT_IMAGE_PDF_DPI,
+        );
         let image_id = document.add_image(&image);
         completed += 1;
         emit_progress_event(
@@ -569,15 +612,17 @@ fn convert_images_to_pdf(
         let margin = params.margin_mm.max(0.0);
         let usable_width_mm = (page_width_mm - margin * 2.0).max(1.0);
         let usable_height_mm = (page_height_mm - margin * 2.0).max(1.0);
+        let image_width_mm = px_to_mm_at_dpi(dimensions.0, DEFAULT_IMAGE_PDF_DPI);
+        let image_height_mm = px_to_mm_at_dpi(dimensions.1, DEFAULT_IMAGE_PDF_DPI);
         let scale = fit_scale(
-            px_to_mm(dimensions.0),
-            px_to_mm(dimensions.1),
+            image_width_mm,
+            image_height_mm,
             usable_width_mm,
             usable_height_mm,
             &params.fit_mode,
         );
-        let placed_width_mm = px_to_mm(dimensions.0) * scale;
-        let placed_height_mm = px_to_mm(dimensions.1) * scale;
+        let placed_width_mm = image_width_mm * scale;
+        let placed_height_mm = image_height_mm * scale;
         let translate_x_mm = ((page_width_mm - placed_width_mm) / 2.0).max(0.0);
         let translate_y_mm = ((page_height_mm - placed_height_mm) / 2.0).max(0.0);
 
@@ -592,7 +637,7 @@ fn convert_images_to_pdf(
                     rotate: None,
                     scale_x: Some(scale),
                     scale_y: Some(scale),
-                    dpi: Some(72.0),
+                    dpi: Some(DEFAULT_IMAGE_PDF_DPI),
                 },
             }],
         ));
@@ -602,9 +647,17 @@ fn convert_images_to_pdf(
         return Err("没有成功处理任何图片，未生成 PDF。".to_string());
     }
 
-    let bytes = document
-        .with_pages(pages)
-        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    let mut save_options = PdfSaveOptions::default();
+    save_options.image_optimization = Some(ImageOptimizationOptions {
+        quality: None,
+        max_image_size: None,
+        dither_greyscale: Some(false),
+        convert_to_greyscale: Some(false),
+        auto_optimize: Some(false),
+        format: Some(ImageCompression::Flate),
+    });
+
+    let bytes = document.with_pages(pages).save(&save_options, &mut Vec::new());
     fs::write(&output_path, bytes).map_err(|error| format!("写入 PDF 失败: {error}"))?;
     let preview_path = match render_pdf_first_page_preview(app, &output_path, &output_root) {
         Ok(path) => path,
@@ -832,8 +885,8 @@ fn unique_target_path(directory: &Path, file_name: &str) -> PathBuf {
     directory.join(file_name)
 }
 
-fn px_to_mm(px: u32) -> f32 {
-    px as f32 * 25.4 / 72.0
+fn px_to_mm_at_dpi(px: u32, dpi: f32) -> f32 {
+    px as f32 * 25.4 / dpi.max(1.0)
 }
 
 fn pdf_render_config(params: &PdfImageParams) -> PdfRenderConfig {
@@ -925,11 +978,15 @@ fn resolve_page_size(
     image_height_px: u32,
     page_size: &str,
     orientation: &str,
+    auto_dpi: f32,
 ) -> (f32, f32) {
     let (mut width, mut height) = match page_size {
         "a4" => (210.0, 297.0),
         "letter" => (215.9, 279.4),
-        _ => (px_to_mm(image_width_px), px_to_mm(image_height_px)),
+        _ => (
+            px_to_mm_at_dpi(image_width_px, auto_dpi),
+            px_to_mm_at_dpi(image_height_px, auto_dpi),
+        ),
     };
 
     let image_is_landscape = image_width_px > image_height_px;
@@ -992,8 +1049,8 @@ fn render_pdf_first_page_preview(
     first_page
         .render_with_config(
             &PdfRenderConfig::new()
-                .set_target_width(680)
-                .set_maximum_height(960)
+                .set_target_width(1200)
+                .set_maximum_height(1600)
                 .render_form_data(true)
                 .render_annotations(true),
         )
@@ -1131,6 +1188,7 @@ fn pdfium_candidates(app: &AppHandle) -> Vec<PathBuf> {
     if let Ok(resource_dir) = app.path().resource_dir() {
         candidates.push(resource_dir.join("pdfium/macos/libpdfium.dylib"));
         candidates.push(resource_dir.join("pdfium/windows/pdfium.dll"));
+        candidates.push(resource_dir.join("pdfium/linux/libpdfium.so"));
         candidates.push(resource_dir.join(pdfium_library_file_name()));
     }
 
@@ -1139,8 +1197,10 @@ fn pdfium_candidates(app: &AppHandle) -> Vec<PathBuf> {
             candidates.push(exe_dir.join(pdfium_library_file_name()));
             candidates.push(exe_dir.join("../Resources/pdfium/macos/libpdfium.dylib"));
             candidates.push(exe_dir.join("../Resources/pdfium/windows/pdfium.dll"));
+            candidates.push(exe_dir.join("../Resources/pdfium/linux/libpdfium.so"));
             candidates.push(exe_dir.join("../../resources/pdfium/macos/libpdfium.dylib"));
             candidates.push(exe_dir.join("../../resources/pdfium/windows/pdfium.dll"));
+            candidates.push(exe_dir.join("../../resources/pdfium/linux/libpdfium.so"));
         }
     }
 
@@ -1148,13 +1208,16 @@ fn pdfium_candidates(app: &AppHandle) -> Vec<PathBuf> {
         candidates.push(current_dir.join(pdfium_library_file_name()));
         candidates.push(current_dir.join("resources/pdfium/macos/libpdfium.dylib"));
         candidates.push(current_dir.join("resources/pdfium/windows/pdfium.dll"));
+        candidates.push(current_dir.join("resources/pdfium/linux/libpdfium.so"));
         candidates.push(current_dir.join("../resources/pdfium/macos/libpdfium.dylib"));
         candidates.push(current_dir.join("../resources/pdfium/windows/pdfium.dll"));
+        candidates.push(current_dir.join("../resources/pdfium/linux/libpdfium.so"));
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("../resources/pdfium/macos/libpdfium.dylib"));
     candidates.push(manifest_dir.join("../resources/pdfium/windows/pdfium.dll"));
+    candidates.push(manifest_dir.join("../resources/pdfium/linux/libpdfium.so"));
     candidates.push(manifest_dir.join(pdfium_library_file_name()));
     candidates.push(PathBuf::from(pdfium_library_file_name()));
 
@@ -1205,6 +1268,8 @@ pub fn run() {
             run_conversion,
             export_outputs,
             clear_session_outputs,
+            copy_files_to_clipboard,
+            copy_image_to_clipboard,
             open_output,
             reveal_output,
             runtime_diagnostics,

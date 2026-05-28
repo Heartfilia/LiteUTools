@@ -24,6 +24,14 @@ const targets = [
     outputDir: join(root, 'resources', 'pdfium', 'windows'),
     outputFile: 'pdfium.dll',
   },
+  {
+    name: 'Linux',
+    url: 'https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-linux-x64.tgz',
+    archiveName: 'pdfium-linux-x64.tgz',
+    extractFile: 'lib/libpdfium.so',
+    outputDir: join(root, 'resources', 'pdfium', 'linux'),
+    outputFile: 'libpdfium.so',
+  },
 ]
 
 async function download(url, destination) {

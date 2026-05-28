@@ -5,6 +5,7 @@ import {
   useState,
   type DragEvent,
   type PointerEvent,
+  type WheelEvent,
 } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
@@ -12,7 +13,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { AnimatePresence, animate, motion } from 'framer-motion'
 import './App.css'
 
-type ToolId = 'convert' | 'blank'
+type ToolId = 'convert' | 'text-compare' | 'blank-2'
 type SourceKind = 'pdf' | 'image'
 
 type ToolDefinition = {
@@ -105,6 +106,32 @@ type ResolvedImport = {
   kind: 'pdf' | 'image' | 'file'
 }
 
+type SelectionBox = {
+  active: boolean
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+type ToolTransition = {
+  id: string
+  tool: ToolDefinition
+  startX: number
+  startY: number
+  targetX: number
+  targetY: number
+  radius: number
+}
+
+type DiffLine = {
+  left: string
+  right: string
+  leftChanged: boolean
+  rightChanged: boolean
+  kind: 'same' | 'changed' | 'added' | 'removed'
+}
+
 const tools: ToolDefinition[] = [
   {
     id: 'convert',
@@ -114,18 +141,26 @@ const tools: ToolDefinition[] = [
     color: 'linear-gradient(135deg, #ff7b54 0%, #ffb26b 100%)',
   },
   {
-    id: 'blank',
-    title: '空白工具位',
-    subtitle: '用于测试圆盘切换、标题联动和后续扩展新工具。',
-    icon: 'LAB',
+    id: 'text-compare',
+    title: '文本对比',
+    subtitle: '左右粘贴两段文本，快速查看逐行差异并清空重输。',
+    icon: 'TXT',
     color: 'linear-gradient(135deg, #5d8cff 0%, #8ec5ff 100%)',
+  },
+  {
+    id: 'blank-2',
+    title: '第二空白页',
+    subtitle: '专门用于测试三个工具页面之间的切换过渡和悬浮球排序效果。',
+    icon: 'ALT',
+    color: 'linear-gradient(135deg, #4eb7a8 0%, #86d7c8 100%)',
   },
 ]
 
 const launcherGap = 16
-const launcherSize = 66
+const launcherSize = 60
 const margin = 28
 const imageExtensions = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tiff']
+const appVersion = __APP_VERSION__
 
 function getErrorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim()) {
@@ -183,6 +218,14 @@ async function invokeBackend<T>(command: string, payload?: Record<string, unknow
   }
 }
 
+function canUseTauriWindowApi() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+
+  return '__TAURI_INTERNALS__' in window || '__TAURI__' in window
+}
+
 function getExtension(path: string) {
   return path.split('.').pop()?.toLowerCase() ?? ''
 }
@@ -198,6 +241,25 @@ function getFileName(path: string) {
 async function dataUrlToBlob(dataUrl: string) {
   const response = await fetch(dataUrl)
   return response.blob()
+}
+
+function isPrimaryImageOutput(item: OutputItem) {
+  return item.kind === 'image'
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  const element = target as HTMLElement | null
+  if (!element) {
+    return false
+  }
+
+  const tagName = element.tagName
+  return (
+    element.isContentEditable ||
+    tagName === 'INPUT' ||
+    tagName === 'TEXTAREA' ||
+    tagName === 'SELECT'
+  )
 }
 
 function classifyPath(path: string): SourceKind | null {
@@ -250,6 +312,57 @@ function buildPagePreviewName(template: string, page: number, format: PdfImageFo
   return `${fileName}.${format === 'jpg' ? 'jpg' : 'png'}`
 }
 
+function buildDiffLines(leftText: string, rightText: string): DiffLine[] {
+  if (!leftText && !rightText) {
+    return []
+  }
+
+  const leftLines = leftText.replace(/\r\n/g, '\n').split('\n')
+  const rightLines = rightText.replace(/\r\n/g, '\n').split('\n')
+  const total = Math.max(leftLines.length, rightLines.length, 1)
+  const lines: DiffLine[] = []
+
+  for (let index = 0; index < total; index += 1) {
+    const left = leftLines[index] ?? ''
+    const right = rightLines[index] ?? ''
+    const hasLeft = index < leftLines.length
+    const hasRight = index < rightLines.length
+
+    if (hasLeft && hasRight) {
+      const changed = left !== right
+      lines.push({
+        left,
+        right,
+        leftChanged: changed,
+        rightChanged: changed,
+        kind: changed ? 'changed' : 'same',
+      })
+      continue
+    }
+
+    if (hasLeft) {
+      lines.push({
+        left,
+        right: '',
+        leftChanged: true,
+        rightChanged: false,
+        kind: 'removed',
+      })
+      continue
+    }
+
+    lines.push({
+      left: '',
+      right,
+      leftChanged: false,
+      rightChanged: true,
+      kind: 'added',
+    })
+  }
+
+  return lines
+}
+
 function getCornerFromAnchor(anchor: { x: number; y: number }) {
   const horizontal = anchor.x + launcherSize / 2 <= window.innerWidth / 2 ? 'left' : 'right'
   const vertical = anchor.y + launcherSize / 2 <= window.innerHeight / 2 ? 'top' : 'bottom'
@@ -270,10 +383,11 @@ function App() {
     total: 0,
     label: '尚未开始',
   })
-  const [draggingSourceId, setDraggingSourceId] = useState<string | null>(null)
-  const [sessionBufferPath, setSessionBufferPath] = useState('')
+  const [, setSessionBufferPath] = useState('')
   const [pdfParamsEnabled, setPdfParamsEnabled] = useState(false)
   const [imageParamsEnabled, setImageParamsEnabled] = useState(false)
+  const [leftCompareText, setLeftCompareText] = useState('')
+  const [rightCompareText, setRightCompareText] = useState('')
   const [pdfImageParams, setPdfImageParams] = useState<PdfImageParams>({
     format: 'png',
     quality: 'standard',
@@ -290,13 +404,45 @@ function App() {
     fileName: 'merged-images',
   })
   const [previewSrcMap, setPreviewSrcMap] = useState<Record<string, string>>({})
+  const [fullPreviewSrcMap, setFullPreviewSrcMap] = useState<Record<string, string>>({})
   const [outputViewMode, setOutputViewMode] = useState<OutputViewMode>('grid')
+  const [selectedOutputIds, setSelectedOutputIds] = useState<string[]>([])
+  const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null)
   const [previewingOutput, setPreviewingOutput] = useState<OutputItem | null>(null)
   const [previewScale, setPreviewScale] = useState(1)
+  const [previewScaleDraft, setPreviewScaleDraft] = useState(100)
   const [previewOffset, setPreviewOffset] = useState({ x: 0, y: 0 })
   const [anchor, setAnchor] = useState({ x: margin, y: 0 })
+  const [isLauncherDragging, setIsLauncherDragging] = useState(false)
+  const [toolTransition, setToolTransition] = useState<ToolTransition | null>(null)
   const launcherLayerRef = useRef<HTMLDivElement | null>(null)
   const activeRunIdRef = useRef<string | null>(null)
+  const transitionIdRef = useRef(0)
+  const leftCompareRef = useRef<HTMLTextAreaElement | null>(null)
+  const rightCompareRef = useRef<HTMLTextAreaElement | null>(null)
+  const leftCompareLayerRef = useRef<HTMLDivElement | null>(null)
+  const rightCompareLayerRef = useRef<HTMLDivElement | null>(null)
+  const compareScrollSyncRef = useRef(false)
+  const lastSelectedOutputIdRef = useRef<string | null>(null)
+  const outputGridRef = useRef<HTMLDivElement | null>(null)
+  const outputCardRefs = useRef<Record<string, HTMLElement | null>>({})
+  const selectionDragRef = useRef<{
+    active: boolean
+    pointerId: number | null
+    originX: number
+    originY: number
+    additive: boolean
+    baseIds: string[]
+    dragged: boolean
+  }>({
+    active: false,
+    pointerId: null,
+    originX: 0,
+    originY: 0,
+    additive: false,
+    baseIds: [],
+    dragged: false,
+  })
   const lightboxStageRef = useRef<HTMLDivElement | null>(null)
   const lightboxImageRef = useRef<HTMLImageElement | null>(null)
   const previewDragRef = useRef({
@@ -309,11 +455,52 @@ function App() {
   const dragRef = useRef({
     active: false,
     moved: false,
+    x: 0,
+    y: 0,
     pointerOffsetX: 0,
     pointerOffsetY: 0,
     width: 0,
     height: 0,
   })
+  const snapAnimationRef = useRef<ReturnType<typeof animate>[] | null>(null)
+
+  const triggerToolSwitch = (tool: ToolDefinition, event: React.MouseEvent<HTMLButtonElement>) => {
+    const sourceRect = event.currentTarget.getBoundingClientRect()
+    const targetRect = launcherLayerRef.current?.getBoundingClientRect()
+
+    if (!targetRect) {
+      setActiveTool(tool.id)
+      setMenuOpen(false)
+      setHoveredTool(null)
+      return
+    }
+
+    const targetX = targetRect.left + targetRect.width / 2
+    const targetY = targetRect.top + targetRect.height / 2
+    const farthestX = Math.max(targetX, window.innerWidth - targetX)
+    const farthestY = Math.max(targetY, window.innerHeight - targetY)
+
+    transitionIdRef.current += 1
+    setToolTransition({
+      id: `${tool.id}-${transitionIdRef.current}`,
+      tool,
+      startX: sourceRect.left + sourceRect.width / 2,
+      startY: sourceRect.top + sourceRect.height / 2,
+      targetX,
+      targetY,
+      radius: Math.hypot(farthestX, farthestY) + 96,
+    })
+    setMenuOpen(false)
+    setHoveredTool(null)
+
+    window.setTimeout(() => {
+      setActiveTool(tool.id)
+    }, 470)
+
+    window.setTimeout(() => {
+      setToolTransition(null)
+    }, 1180)
+  }
 
   const currentTool = useMemo(
     () => tools.find((tool) => tool.id === activeTool) ?? tools[0],
@@ -350,10 +537,109 @@ function App() {
       })),
     [outputs, previewSrcMap],
   )
+  const selectedOutputSet = useMemo(() => new Set(selectedOutputIds), [selectedOutputIds])
+  const selectedOutputs = useMemo(
+    () => outputs.filter((item) => selectedOutputSet.has(item.id)),
+    [outputs, selectedOutputSet],
+  )
+  const selectedOutputCount = selectedOutputs.length
   const previewingIndex = useMemo(
     () => outputCards.findIndex((item) => item.id === previewingOutput?.id),
     [outputCards, previewingOutput],
   )
+  const previewDisplaySrc = previewingOutput
+    ? fullPreviewSrcMap[previewingOutput.id] || previewSrcMap[previewingOutput.id]
+    : ''
+  const diffLines = useMemo(
+    () => buildDiffLines(leftCompareText, rightCompareText),
+    [leftCompareText, rightCompareText],
+  )
+  const diffSummary = useMemo(
+    () => ({
+      changed: diffLines.filter((line) => line.kind === 'changed').length,
+      added: diffLines.filter((line) => line.kind === 'added').length,
+      removed: diffLines.filter((line) => line.kind === 'removed').length,
+    }),
+    [diffLines],
+  )
+  const syncCompareScroll = (source: 'left' | 'right') => {
+    if (compareScrollSyncRef.current) {
+      return
+    }
+
+    const sourceElement = source === 'left' ? leftCompareRef.current : rightCompareRef.current
+
+    if (!sourceElement) {
+      return
+    }
+
+    compareScrollSyncRef.current = true
+    const top = sourceElement.scrollTop
+    const left = sourceElement.scrollLeft
+    if (source !== 'left' && leftCompareRef.current) {
+      leftCompareRef.current.scrollTop = top
+    }
+    if (source !== 'right' && rightCompareRef.current) {
+      rightCompareRef.current.scrollTop = top
+    }
+    if (source !== 'left' && leftCompareRef.current) {
+      leftCompareRef.current.scrollLeft = left
+    }
+    if (source !== 'right' && rightCompareRef.current) {
+      rightCompareRef.current.scrollLeft = left
+    }
+    if (leftCompareLayerRef.current && source === 'left') {
+      leftCompareLayerRef.current.style.transform = `translate(${-left}px, ${-top}px)`
+    }
+    if (rightCompareLayerRef.current && source === 'right') {
+      rightCompareLayerRef.current.style.transform = `translate(${-left}px, ${-top}px)`
+    }
+    if (source === 'left' && rightCompareLayerRef.current) {
+      rightCompareLayerRef.current.style.transform = `translate(${-left}px, ${-top}px)`
+    }
+    if (source === 'right' && leftCompareLayerRef.current) {
+      leftCompareLayerRef.current.style.transform = `translate(${-left}px, ${-top}px)`
+    }
+    window.requestAnimationFrame(() => {
+      compareScrollSyncRef.current = false
+    })
+  }
+
+  const selectOutputsInBox = (
+    nextBox: SelectionBox,
+    baseIds: string[],
+    additive: boolean,
+  ) => {
+    const container = outputGridRef.current
+    if (!container) {
+      return
+    }
+
+    const containerRect = container.getBoundingClientRect()
+    const hitIds = outputCards
+      .filter((item) => {
+        const element = outputCardRefs.current[item.id]
+        if (!element) {
+          return false
+        }
+
+        const rect = element.getBoundingClientRect()
+        const left = rect.left - containerRect.left
+        const top = rect.top - containerRect.top
+        const right = left + rect.width
+        const bottom = top + rect.height
+
+        return !(
+          right < nextBox.x ||
+          left > nextBox.x + nextBox.width ||
+          bottom < nextBox.y ||
+          top > nextBox.y + nextBox.height
+        )
+      })
+      .map((item) => item.id)
+
+    setSelectedOutputIds(additive ? Array.from(new Set([...baseIds, ...hitIds])) : hitIds)
+  }
 
   const clampPreviewOffset = (offsetX: number, offsetY: number, scale: number) => {
     const stage = lightboxStageRef.current
@@ -382,7 +668,7 @@ function App() {
 
     if (Math.abs(previewScale - 1) < 0.05) {
       const actualScale = Math.min(
-        3,
+        2,
         Math.max(
           1,
           image.naturalWidth > 0 ? image.naturalWidth / Math.max(image.clientWidth, 1) : 1,
@@ -390,11 +676,13 @@ function App() {
         ),
       )
       setPreviewScale(actualScale)
+      setPreviewScaleDraft(Math.round(actualScale * 100))
       setPreviewOffset(clampPreviewOffset(0, 0, actualScale))
       return
     }
 
     setPreviewScale(1)
+    setPreviewScaleDraft(100)
     setPreviewOffset({ x: 0, y: 0 })
   }
 
@@ -441,6 +729,10 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!canUseTauriWindowApi()) {
+      return
+    }
+
     const unlistenPromise = getCurrentWindow().listen<ConversionProgressEvent>(
       'conversion-progress',
       (event) => {
@@ -486,6 +778,27 @@ function App() {
   }, [outputs, previewSrcMap])
 
   useEffect(() => {
+    if (!previewingOutput || fullPreviewSrcMap[previewingOutput.id]) {
+      return
+    }
+
+    const sourcePath =
+      previewingOutput.kind === 'image' || previewingOutput.kind === 'pdf'
+        ? previewingOutput.path
+        : previewingOutput.previewPath
+
+    if (!sourcePath) {
+      return
+    }
+
+    void invokeBackend<string>('load_preview_data', { path: sourcePath })
+      .then((dataUrl) => {
+        setFullPreviewSrcMap((current) => ({ ...current, [previewingOutput.id]: dataUrl }))
+      })
+      .catch(() => undefined)
+  }, [fullPreviewSrcMap, previewingOutput])
+
+  useEffect(() => {
     if (!menuOpen) {
       return
     }
@@ -508,29 +821,47 @@ function App() {
       return
     }
 
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code === 'Space' || event.key.startsWith('Arrow')) {
+        event.preventDefault()
+        event.stopPropagation()
+      }
+
       if (event.key === 'Escape') {
         setPreviewingOutput(null)
         setPreviewScale(1)
+        setPreviewScaleDraft(100)
         setPreviewOffset({ x: 0, y: 0 })
         return
       }
 
-      if (event.key === 'ArrowRight' && previewingIndex >= 0 && previewingIndex < outputCards.length - 1) {
+      if (
+        (event.key === 'ArrowRight' || event.code === 'Space') &&
+        previewingIndex >= 0 &&
+        previewingIndex < outputCards.length - 1
+      ) {
         setPreviewingOutput(outputCards[previewingIndex + 1])
         setPreviewScale(1)
+        setPreviewScaleDraft(100)
         setPreviewOffset({ x: 0, y: 0 })
       }
 
       if (event.key === 'ArrowLeft' && previewingIndex > 0) {
         setPreviewingOutput(outputCards[previewingIndex - 1])
         setPreviewScale(1)
+        setPreviewScaleDraft(100)
         setPreviewOffset({ x: 0, y: 0 })
       }
     }
 
     window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', handleKeyDown)
+    }
   }, [outputCards, previewingIndex, previewingOutput])
 
   const snapToNearestCorner = (x: number, y: number) => {
@@ -571,7 +902,10 @@ function App() {
 
     setSources(nextSources)
     setOutputs([])
+    setSelectedOutputIds([])
+    lastSelectedOutputIdRef.current = null
     setPreviewSrcMap({})
+    setFullPreviewSrcMap({})
     setErrors([])
     setProgress({ current: 0, total: 0, label: '尚未开始' })
     setStatusText(nextSources.length > 0 ? `已导入 ${nextSources.length} 个文件` : '没有可用文件')
@@ -610,7 +944,10 @@ function App() {
     const nextSources = rehydrateImageDetails(sources.filter((item) => item.id !== id))
     setSources(nextSources)
     setOutputs([])
+    setSelectedOutputIds([])
+    lastSelectedOutputIdRef.current = null
     setPreviewSrcMap({})
+    setFullPreviewSrcMap({})
     setErrors([])
     setProgress({ current: 0, total: 0, label: '尚未开始' })
     if (nextSources.length === 0) {
@@ -620,19 +957,35 @@ function App() {
     }
   }
 
-  const moveSource = (fromId: string, toId: string) => {
-    if (fromId === toId) {
+  const moveSource = (id: string, direction: -1 | 1) => {
+    const fromIndex = sources.findIndex((item) => item.id === id)
+    if (fromIndex < 0) {
       return
     }
 
-    const fromIndex = sources.findIndex((item) => item.id === fromId)
-    const toIndex = sources.findIndex((item) => item.id === toId)
-    if (fromIndex < 0 || toIndex < 0) {
+    const toIndex = fromIndex + direction
+    if (toIndex < 0 || toIndex >= sources.length) {
       return
     }
 
     const nextSources = rehydrateImageDetails(reorder(sources, fromIndex, toIndex))
     setSources(nextSources)
+  }
+
+  const handleCompareWheel = (source: 'left' | 'right', event: WheelEvent<HTMLTextAreaElement>) => {
+    const editor = source === 'left' ? leftCompareRef.current : rightCompareRef.current
+    if (!editor) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+
+    const horizontalDelta =
+      event.shiftKey && Math.abs(event.deltaX) < Math.abs(event.deltaY) ? event.deltaY : event.deltaX
+    editor.scrollLeft += horizontalDelta
+    editor.scrollTop += event.shiftKey ? 0 : event.deltaY
+    syncCompareScroll(source)
   }
 
   const runAction = async (mode: 'pdf-to-images' | 'images-to-pdf') => {
@@ -652,7 +1005,10 @@ function App() {
     setIsBusy(true)
     setErrors([])
     setOutputs([])
+    setSelectedOutputIds([])
+    lastSelectedOutputIdRef.current = null
     setPreviewSrcMap({})
+    setFullPreviewSrcMap({})
     setProgress({
       current: 0,
       total: mode === 'pdf-to-images' ? Math.max(pdfSources.length, 1) : imageSources.length,
@@ -717,18 +1073,8 @@ function App() {
   }
 
   const exportSelectedResults = async () => {
-    const selection = window.getSelection()?.toString().trim() ?? ''
-    if (!selection) {
-      setStatusText('先在输出区选中文件名')
-      return
-    }
-
-    const selectedOutputPaths = outputs
-      .filter((item) => selection.includes(item.label))
-      .map((item) => item.path)
-
-    if (selectedOutputPaths.length === 0) {
-      setStatusText('当前选区里没有匹配到可导出的结果')
+    if (selectedOutputs.length === 0) {
+      setStatusText('先点选要导出的结果')
       return
     }
 
@@ -743,7 +1089,7 @@ function App() {
 
     try {
       const exported = await invokeBackend<OutputItem[]>('export_outputs', {
-        outputs: selectedOutputPaths,
+        outputs: selectedOutputs.map((item) => item.path),
         destinationDir: selected,
       })
       setStatusText(`已导出 ${exported.length} 个选中结果到 ${selected}`)
@@ -758,12 +1104,46 @@ function App() {
       return
     }
 
-    const text = outputs.map((item) => item.path).join('\n')
+    const targetOutputs = selectedOutputs.length > 0 ? selectedOutputs : outputs
+    const text = targetOutputs.map((item) => item.path).join('\n')
     try {
       await navigator.clipboard.writeText(text)
-      setStatusText('已复制结果路径列表')
+      setStatusText(
+        selectedOutputs.length > 0
+          ? `已复制 ${selectedOutputs.length} 个选中结果的路径`
+          : '已复制全部结果路径',
+      )
     } catch {
       setStatusText('复制失败，请检查系统剪贴板权限')
+    }
+  }
+
+  const copySingleOutputImage = async (item: OutputItem) => {
+    if (item.kind !== 'image') {
+      return false
+    }
+
+    const sourceDataUrl = fullPreviewSrcMap[item.id] || previewSrcMap[item.id]
+    const imageDataUrl = sourceDataUrl || (await invokeBackend<string>('load_preview_data', { path: item.path }))
+
+    if (typeof navigator.clipboard?.write !== 'function' || typeof ClipboardItem === 'undefined') {
+      setStatusText('当前环境不支持直接复制图片到剪贴板')
+      return true
+    }
+
+    try {
+      const blob = await dataUrlToBlob(imageDataUrl)
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          [blob.type || 'image/png']: blob,
+        }),
+      ])
+      setFullPreviewSrcMap((current) => ({ ...current, [item.id]: imageDataUrl }))
+      setStatusText(`已复制图片：${item.label}`)
+      return true
+    } catch {
+      setStatusText('复制图片失败，请检查系统剪贴板权限')
+      return true
     }
   }
 
@@ -777,34 +1157,15 @@ function App() {
       setStatusText('当前结果不是图片，暂时不能直接复制图片本体')
       return
     }
-
-    const previewSrc = previewSrcMap[previewingOutput.id]
-    if (!previewSrc) {
-      setStatusText('当前图片预览还没准备好，稍后再试一次')
-      return
-    }
-
-    if (typeof navigator.clipboard?.write !== 'function' || typeof ClipboardItem === 'undefined') {
-      setStatusText('当前环境不支持直接复制图片到剪贴板')
-      return
-    }
-
-    try {
-      const blob = await dataUrlToBlob(previewSrc)
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          [blob.type || 'image/png']: blob,
-        }),
-      ])
-      setStatusText(`已复制图片：${previewingOutput.label}`)
-    } catch {
-      setStatusText('复制图片失败，请检查系统剪贴板权限')
-    }
+    await copySingleOutputImage(previewingOutput)
   }
 
   const clearResults = async () => {
     setOutputs([])
+    setSelectedOutputIds([])
+    lastSelectedOutputIdRef.current = null
     setPreviewSrcMap({})
+    setFullPreviewSrcMap({})
     setErrors([])
     setProgress({ current: 0, total: 0, label: '尚未开始' })
     setSessionBufferPath('')
@@ -817,34 +1178,249 @@ function App() {
   }
 
   const clearSelectedResults = () => {
-    const selection = window.getSelection()?.toString().trim() ?? ''
-    if (!selection) {
-      setStatusText('先在输出区选中文件名')
+    if (selectedOutputs.length === 0) {
+      setStatusText('先点选要移除的结果')
       return
     }
 
-    const selectedIds = outputs
-      .filter((item) => selection.includes(item.label))
-      .map((item) => item.id)
-
-    if (selectedIds.length === 0) {
-      setStatusText('当前选区里没有匹配到可清理的结果')
-      return
-    }
-
+    const selectedIds = selectedOutputs.map((item) => item.id)
     const nextOutputs = outputs.filter((item) => !selectedIds.includes(item.id))
     setOutputs(nextOutputs)
+    setSelectedOutputIds([])
+    lastSelectedOutputIdRef.current = null
     setPreviewSrcMap((current) =>
       Object.fromEntries(Object.entries(current).filter(([id]) => !selectedIds.includes(id))),
     )
-    setStatusText(`已从缓冲区移除 ${outputs.length - nextOutputs.length} 个结果`)
+    setFullPreviewSrcMap((current) =>
+      Object.fromEntries(Object.entries(current).filter(([id]) => !selectedIds.includes(id))),
+    )
+    setStatusText(`已从缓冲区移除 ${selectedIds.length} 个结果`)
   }
 
+  const openOutputPreview = (item: OutputItem) => {
+    setPreviewingOutput(item)
+    setPreviewScale(1)
+    setPreviewScaleDraft(100)
+    setPreviewOffset({ x: 0, y: 0 })
+  }
+
+  const handleOutputSelect = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    item: OutputItem,
+    index: number,
+  ) => {
+    if (event.shiftKey && lastSelectedOutputIdRef.current) {
+      const anchorIndex = outputCards.findIndex((entry) => entry.id === lastSelectedOutputIdRef.current)
+      if (anchorIndex >= 0) {
+        const start = Math.min(anchorIndex, index)
+        const end = Math.max(anchorIndex, index)
+        setSelectedOutputIds(outputCards.slice(start, end + 1).map((entry) => entry.id))
+        return
+      }
+    }
+
+    if (event.metaKey || event.ctrlKey) {
+      setSelectedOutputIds((current) =>
+        current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id],
+      )
+      lastSelectedOutputIdRef.current = item.id
+      return
+    }
+
+    setSelectedOutputIds([item.id])
+    lastSelectedOutputIdRef.current = item.id
+  }
+
+  const handleOutputGridPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) {
+      return
+    }
+
+    const container = outputGridRef.current
+    if (!container) {
+      return
+    }
+
+    const rect = container.getBoundingClientRect()
+    const originX = event.clientX - rect.left
+    const originY = event.clientY - rect.top
+    const additive = event.metaKey || event.ctrlKey
+    const baseIds = additive ? selectedOutputIds : []
+
+    selectionDragRef.current = {
+      active: true,
+      pointerId: event.pointerId,
+      originX,
+      originY,
+      additive,
+      baseIds,
+      dragged: false,
+    }
+
+    setSelectionBox({
+      active: true,
+      x: originX,
+      y: originY,
+      width: 0,
+      height: 0,
+    })
+
+    if (!additive) {
+      setSelectedOutputIds([])
+      lastSelectedOutputIdRef.current = null
+    }
+
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  const handleOutputGridPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!selectionDragRef.current.active) {
+      return
+    }
+
+    const container = outputGridRef.current
+    if (!container) {
+      return
+    }
+
+    const rect = container.getBoundingClientRect()
+    const currentX = Math.min(Math.max(0, event.clientX - rect.left), rect.width)
+    const currentY = Math.min(Math.max(0, event.clientY - rect.top), rect.height)
+    const nextBox = {
+      active: true,
+      x: Math.min(selectionDragRef.current.originX, currentX),
+      y: Math.min(selectionDragRef.current.originY, currentY),
+      width: Math.abs(currentX - selectionDragRef.current.originX),
+      height: Math.abs(currentY - selectionDragRef.current.originY),
+    }
+
+    if (nextBox.width > 4 || nextBox.height > 4) {
+      selectionDragRef.current.dragged = true
+    }
+
+    setSelectionBox(nextBox)
+    selectOutputsInBox(
+      nextBox,
+      selectionDragRef.current.baseIds,
+      selectionDragRef.current.additive,
+    )
+  }
+
+  const finishOutputGridSelection = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!selectionDragRef.current.active) {
+      return
+    }
+
+    if (selectionDragRef.current.dragged) {
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    selectionDragRef.current.active = false
+    selectionDragRef.current.pointerId = null
+    setSelectionBox(null)
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (previewingOutput || isEditableTarget(event.target)) {
+        return
+      }
+
+      const key = event.key.toLowerCase()
+
+      if ((event.metaKey || event.ctrlKey) && key === 'a' && outputs.length > 0) {
+        event.preventDefault()
+        setSelectedOutputIds(outputs.map((item) => item.id))
+        lastSelectedOutputIdRef.current = outputs[outputs.length - 1]?.id ?? null
+        return
+      }
+
+      if ((event.metaKey || event.ctrlKey) && key === 'c' && selectedOutputCount > 0) {
+        event.preventDefault()
+        if (selectedOutputs.length === 0) {
+          setStatusText('先选中要复制的结果')
+          return
+        }
+
+        if (selectedOutputs.length === 1 && isPrimaryImageOutput(selectedOutputs[0])) {
+          const selectedItem = selectedOutputs[0]
+          void invokeBackend<void>('copy_image_to_clipboard', { path: selectedItem.path })
+            .then(() => setStatusText(`已复制图片：${selectedItem.label}`))
+            .catch((error) => setStatusText(getErrorMessage(error, '复制图片失败')))
+          return
+        }
+
+        void invokeBackend<void>('copy_files_to_clipboard', {
+          paths: selectedOutputs.map((item) => item.path),
+        })
+          .then(() => setStatusText(`已复制 ${selectedOutputs.length} 个文件`))
+          .catch(async (error) => {
+            const text = selectedOutputs.map((item) => item.path).join('\n')
+            try {
+              await navigator.clipboard.writeText(text)
+              setStatusText(`已复制 ${selectedOutputs.length} 个结果路径`)
+            } catch {
+              setStatusText(getErrorMessage(error, '复制失败，请检查系统剪贴板权限'))
+            }
+          })
+        return
+      }
+
+      if (event.code === 'Space' && selectedOutputCount > 0) {
+        event.preventDefault()
+        const activeSelection =
+          selectedOutputs.find((item) => item.id === lastSelectedOutputIdRef.current) ?? selectedOutputs[0]
+        if (!activeSelection || activeSelection.kind !== 'image') {
+          setStatusText('空格预览只支持图片结果，PDF 可以导出后用系统应用查看。')
+          return
+        }
+        setPreviewingOutput(activeSelection)
+        setPreviewScale(1)
+        setPreviewScaleDraft(100)
+        setPreviewOffset({ x: 0, y: 0 })
+        return
+      }
+
+      if ((event.key === 'Backspace' || event.key === 'Delete') && selectedOutputCount > 0) {
+        event.preventDefault()
+        const selectedIds = selectedOutputs.map((item) => item.id)
+        const nextOutputs = outputs.filter((item) => !selectedIds.includes(item.id))
+        setOutputs(nextOutputs)
+        setSelectedOutputIds([])
+        lastSelectedOutputIdRef.current = null
+        setPreviewSrcMap((current) =>
+          Object.fromEntries(Object.entries(current).filter(([id]) => !selectedIds.includes(id))),
+        )
+        setStatusText(`已从缓冲区移除 ${selectedIds.length} 个结果`)
+        return
+      }
+
+      if (event.key === 'Escape' && selectedOutputCount > 0) {
+        setSelectedOutputIds([])
+        lastSelectedOutputIdRef.current = null
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [outputs, previewingOutput, selectedOutputCount, selectedOutputs])
+
   const handlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
-    const bounds = event.currentTarget.getBoundingClientRect()
+    snapAnimationRef.current?.forEach((controls) => controls.stop())
+    snapAnimationRef.current = null
+
+    const layer = launcherLayerRef.current
+    const bounds = layer?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect()
     dragRef.current = {
       active: true,
       moved: false,
+      x: anchor.x,
+      y: anchor.y,
       pointerOffsetX: event.clientX - bounds.left,
       pointerOffsetY: event.clientY - bounds.top,
       width: bounds.width,
@@ -852,6 +1428,7 @@ function App() {
     }
 
     event.currentTarget.setPointerCapture(event.pointerId)
+    setIsLauncherDragging(true)
     setHoveredTool(null)
     setMenuOpen(false)
   }
@@ -865,15 +1442,20 @@ function App() {
     const nextY = event.clientY - dragRef.current.pointerOffsetY
     const maxX = window.innerWidth - dragRef.current.width - margin
     const maxY = window.innerHeight - dragRef.current.height - margin
+    const clampedX = Math.min(Math.max(margin, nextX), maxX)
+    const clampedY = Math.min(Math.max(margin, nextY), maxY)
 
-    if (Math.abs(nextX - anchor.x) > 3 || Math.abs(nextY - anchor.y) > 3) {
+    if (Math.abs(clampedX - anchor.x) > 3 || Math.abs(clampedY - anchor.y) > 3) {
       dragRef.current.moved = true
     }
 
-    setAnchor({
-      x: Math.min(Math.max(margin, nextX), maxX),
-      y: Math.min(Math.max(margin, nextY), maxY),
-    })
+    dragRef.current.x = clampedX
+    dragRef.current.y = clampedY
+
+    if (launcherLayerRef.current) {
+      launcherLayerRef.current.style.left = `${clampedX}px`
+      launcherLayerRef.current.style.top = `${clampedY}px`
+    }
   }
 
   const handlePointerUp = (event: PointerEvent<HTMLButtonElement>) => {
@@ -882,16 +1464,58 @@ function App() {
     }
 
     dragRef.current.active = false
+    setIsLauncherDragging(false)
     event.currentTarget.releasePointerCapture(event.pointerId)
-    const snapped = snapToNearestCorner(anchor.x, anchor.y)
-    animate(anchor.x, snapped.x, {
-      duration: 0.24,
-      onUpdate: (value) => setAnchor((current) => ({ ...current, x: value })),
+    const currentX = dragRef.current.x
+    const currentY = dragRef.current.y
+    const snapped = snapToNearestCorner(currentX, currentY)
+    const layer = launcherLayerRef.current
+    let latestX = currentX
+    let latestY = currentY
+
+    const syncFinalAnchor = () => {
+      if (Math.abs(latestX - snapped.x) < 0.5 && Math.abs(latestY - snapped.y) < 0.5) {
+        setAnchor(snapped)
+        snapAnimationRef.current = null
+      }
+    }
+
+    const xAnimation = animate(currentX, snapped.x, {
+      type: 'spring',
+      stiffness: 520,
+      damping: 38,
+      mass: 0.72,
+      onUpdate: (value) => {
+        latestX = value
+        if (layer) {
+          layer.style.left = `${value}px`
+        }
+      },
+      onComplete: syncFinalAnchor,
     })
-    animate(anchor.y, snapped.y, {
-      duration: 0.24,
-      onUpdate: (value) => setAnchor((current) => ({ ...current, y: value })),
+
+    const yAnimation = animate(currentY, snapped.y, {
+      type: 'spring',
+      stiffness: 520,
+      damping: 38,
+      mass: 0.72,
+      onUpdate: (value) => {
+        latestY = value
+        if (layer) {
+          layer.style.top = `${value}px`
+        }
+      },
+      onComplete: syncFinalAnchor,
     })
+
+    snapAnimationRef.current = [xAnimation, yAnimation]
+  }
+
+  const handlePointerCancel = () => {
+    snapAnimationRef.current?.forEach((controls) => controls.stop())
+    snapAnimationRef.current = null
+    dragRef.current.active = false
+    setIsLauncherDragging(false)
   }
 
   return (
@@ -899,31 +1523,144 @@ function App() {
       <div className="ambient ambient-left" />
       <div className="ambient ambient-right" />
 
-      <section className="workspace-card">
-        <header className="workspace-banner">
-          <div>
-            <p className="section-kicker">工作区</p>
-            <h2>{currentTool.title}</h2>
-            <p>{currentTool.subtitle}</p>
-          </div>
-          <div className="status-badge">{statusText}</div>
-        </header>
+      <section className={`workspace-card ${activeTool === 'text-compare' ? 'workspace-card-compact' : ''}`}>
+        {activeTool !== 'text-compare' && (
+          <header className="workspace-banner">
+            <div>
+              <p className="section-kicker">工作区</p>
+              <div className="title-row">
+                <h2>{currentTool.title}</h2>
+                <span className="version-badge">v{appVersion}</span>
+              </div>
+              <p>{currentTool.subtitle}</p>
+            </div>
+            <div className="status-badge">{statusText}</div>
+          </header>
+        )}
 
-        {activeTool === 'blank' ? (
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={activeTool}
+            className="tool-page-shell"
+            initial={{ opacity: 0, scale: 0.988, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.992, y: -10 }}
+            transition={{ duration: 0.34, ease: [0.22, 0.72, 0.18, 1] }}
+          >
+        {activeTool === 'text-compare' ? (
+          <section className="compare-workspace">
+	            <div className="compare-toolbar">
+		              <div className="compare-title-row">
+		                <strong className="compare-mini-title">文本对比</strong>
+		                <span className="version-badge">v{appVersion}</span>
+		              </div>
+	              <div className="compare-summary">
+	                <span>修改 {diffSummary.changed}</span>
+	                <span>新增 {diffSummary.added}</span>
+	                <span>删除 {diffSummary.removed}</span>
+	              </div>
+	              <button
+                type="button"
+                className="clear-compare-button"
+                onClick={() => {
+                  setLeftCompareText('')
+                  setRightCompareText('')
+                  if (leftCompareRef.current) {
+                    leftCompareRef.current.scrollTop = 0
+                    leftCompareRef.current.scrollLeft = 0
+                  }
+                  if (rightCompareRef.current) {
+                    rightCompareRef.current.scrollTop = 0
+                    rightCompareRef.current.scrollLeft = 0
+                  }
+                  if (leftCompareLayerRef.current) {
+                    leftCompareLayerRef.current.style.transform = 'translate(0, 0)'
+                  }
+                  if (rightCompareLayerRef.current) {
+                    rightCompareLayerRef.current.style.transform = 'translate(0, 0)'
+                  }
+                }}
+              >
+                清屏
+              </button>
+            </div>
+
+            <div className="compare-diff-shell">
+              <div className="compare-editor-panel">
+                <div className="compare-editor-head">
+                  <strong>左侧文本</strong>
+                  <span>{leftCompareText.length} 字符</span>
+                </div>
+                <div className="compare-editor-shell">
+                  <div ref={leftCompareLayerRef} className="compare-diff-layer" aria-hidden>
+                    {diffLines.map((line, index) => (
+                      <div
+                        key={`left-layer-${index}-${line.kind}`}
+                        className={`compare-line compare-line-${line.kind} ${line.leftChanged ? 'is-changed' : ''}`}
+                      >
+                        <span className="compare-line-number">{index + 1}</span>
+                        <code>{line.left || ' '}</code>
+                      </div>
+                    ))}
+                  </div>
+	                  <textarea
+	                    ref={leftCompareRef}
+	                    className="compare-editor"
+	                    value={leftCompareText}
+	                    onScroll={() => syncCompareScroll('left')}
+	                    onWheel={(event) => handleCompareWheel('left', event)}
+	                    onChange={(event) => setLeftCompareText(event.target.value)}
+                    placeholder="把第一段文本粘贴到这里..."
+                    spellCheck={false}
+                    wrap="off"
+                  />
+                </div>
+              </div>
+
+              <div className="compare-editor-panel">
+                <div className="compare-editor-head">
+                  <strong>右侧文本</strong>
+                  <span>{rightCompareText.length} 字符</span>
+                </div>
+                <div className="compare-editor-shell">
+                  <div ref={rightCompareLayerRef} className="compare-diff-layer" aria-hidden>
+                    {diffLines.map((line, index) => (
+                      <div
+                        key={`right-layer-${index}-${line.kind}`}
+                        className={`compare-line compare-line-${line.kind} ${line.rightChanged ? 'is-changed' : ''}`}
+                      >
+                        <span className="compare-line-number">{index + 1}</span>
+                        <code>{line.right || ' '}</code>
+                      </div>
+                    ))}
+                  </div>
+	                  <textarea
+	                    ref={rightCompareRef}
+	                    className="compare-editor"
+	                    value={rightCompareText}
+	                    onScroll={() => syncCompareScroll('right')}
+	                    onWheel={(event) => handleCompareWheel('right', event)}
+	                    onChange={(event) => setRightCompareText(event.target.value)}
+                    placeholder="把第二段文本粘贴到这里..."
+                    spellCheck={false}
+                    wrap="off"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+        ) : activeTool === 'blank-2' ? (
           <section className="blank-workspace">
             <div className="blank-orb">{currentTool.icon}</div>
-            <h3>这里是第二个工具栏目</h3>
+            <h3>这里是第三个工具栏目</h3>
             <p>
-              这个页面目前保持空白，主要用来测试悬浮工具气泡的展开、收起、标题跟随和页面切换过渡是否自然。
+              这个页面保持空白，用来确认三个工具位之间切换时，悬浮球的排序、换位和过渡动画是否稳定。
             </p>
           </section>
         ) : (
         <div className="workspace-grid">
           <aside className="pane pane-source">
             <div className="pane-head">
-              <div>
-                <h3>输入区</h3>
-              </div>
               <span>{sources.length} 项</span>
             </div>
 
@@ -941,34 +1678,39 @@ function App() {
 
             {sources.length > 0 ? (
               <ul className="item-list source-list">
-                {sources.map((item, index) => (
-                  <li
-                    key={item.id}
-                    className={`source-item ${draggingSourceId === item.id ? 'is-dragging' : ''}`}
-                    draggable={item.kind === 'image'}
-                    onDragStart={() => setDraggingSourceId(item.id)}
-                    onDragEnd={() => setDraggingSourceId(null)}
-                    onDragOver={(event) => {
-                      if (draggingSourceId && draggingSourceId !== item.id) {
-                        event.preventDefault()
-                      }
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault()
-                      if (draggingSourceId) {
-                        moveSource(draggingSourceId, item.id)
-                      }
-                      setDraggingSourceId(null)
-                    }}
-                  >
-                    <span className={`type-pill type-${item.kind}`}>
-                      {item.kind === 'pdf' ? 'PDF' : 'IMG'}
-                    </span>
-                    <div className="source-copy">
-                      <strong>{item.name}</strong>
-                      <p>{item.detail}</p>
-                    </div>
-                    <span className="order-mark">{index + 1}</span>
+	                {sources.map((item, index) => (
+	                  <li
+	                    key={item.id}
+	                    className="source-item"
+	                  >
+	                    <span className={`type-pill type-${item.kind}`}>
+	                      {item.kind === 'pdf' ? 'PDF' : 'IMG'}
+	                    </span>
+	                    <div className="source-copy">
+	                      <strong>{item.name}</strong>
+	                      <p>{item.kind === 'image' ? '用右侧上移 / 下移调整合并顺序' : item.detail}</p>
+	                    </div>
+		                    {item.kind === 'image' && (
+		                      <div className="source-order-actions" aria-label={`${item.name} 排序操作`}>
+		                        <button
+		                          type="button"
+		                          className="source-order-button"
+		                          disabled={index === 0}
+		                          onClick={() => moveSource(item.id, -1)}
+		                        >
+		                          上移
+		                        </button>
+		                        <button
+		                          type="button"
+		                          className="source-order-button"
+		                          disabled={index === sources.length - 1}
+		                          onClick={() => moveSource(item.id, 1)}
+		                        >
+		                          下移
+		                        </button>
+		                      </div>
+		                    )}
+	                    <span className="order-mark">{index + 1}</span>
                     <button
                       type="button"
                       className="remove-button"
@@ -983,7 +1725,7 @@ function App() {
             ) : (
               <div className="empty-source-state">
                 <strong>这里会显示你刚导入的文件</strong>
-                <p>导入后会直接出现在这个区域，图片也可以在这里拖动调整顺序。</p>
+                <p>导入后会直接出现在这个区域，图片可用上移 / 下移调整顺序，合成 PDF 时会按这里的顺序输出。</p>
               </div>
             )}
 
@@ -996,7 +1738,7 @@ function App() {
               <div className="action-row action-row-top">
                 <button
                   type="button"
-                  className="ghost-button"
+                  className={`tool-action-button ${hasPdfSources && !isBusy ? 'is-ready' : ''}`}
                   disabled={isBusy || !hasPdfSources}
                   onClick={() => runAction('pdf-to-images')}
                 >
@@ -1004,7 +1746,7 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  className="solid-button"
+                  className={`tool-action-button ${hasImageSources && !isBusy ? 'is-ready' : ''}`}
                   disabled={isBusy || !hasImageSources}
                   onClick={() => runAction('images-to-pdf')}
                 >
@@ -1234,21 +1976,12 @@ function App() {
                 </div>
               )}
 
-              <div className="output-control output-control-inline">
-                <div>
-                  <strong>会话缓冲区</strong>
-                  <p>{sessionBufferPath || '尚未生成结果，本次启动结束后会自动清空。'}</p>
-                </div>
-              </div>
-            </div>
+	            </div>
           </aside>
 
           <section className="pane pane-output">
             <div className="pane-head">
-              <div>
-                <h3>输出区</h3>
-              </div>
-              <span>{outputs.length} 个结果</span>
+              <span>{selectedOutputCount > 0 ? `已选 ${selectedOutputCount} 项` : `${outputs.length} 个结果`}</span>
             </div>
 
             <div className="progress-panel">
@@ -1320,17 +2053,38 @@ function App() {
               </div>
             )}
 
-            <div className={`output-grid output-grid-${outputViewMode}`}>
+            <div
+              ref={outputGridRef}
+              className={`output-grid output-grid-${outputViewMode}`}
+              onPointerDown={handleOutputGridPointerDown}
+              onPointerMove={handleOutputGridPointerMove}
+              onPointerUp={finishOutputGridSelection}
+              onPointerCancel={finishOutputGridSelection}
+              onClick={(event) => {
+                if (selectionDragRef.current.dragged) {
+                  selectionDragRef.current.dragged = false
+                  return
+                }
+
+                if (event.target === event.currentTarget) {
+                  setSelectedOutputIds([])
+                  lastSelectedOutputIdRef.current = null
+                }
+              }}
+            >
               {outputCards.map((item, index) => (
-                <article key={item.id} className={`output-card output-card-${outputViewMode}`}>
+                <article
+                  key={item.id}
+                  className={`output-card output-card-${outputViewMode} ${selectedOutputSet.has(item.id) ? 'is-selected' : ''}`}
+                  ref={(node) => {
+                    outputCardRefs.current[item.id] = node
+                  }}
+                >
                   <button
                     type="button"
                     className="preview-button"
-                    onDoubleClick={() => {
-                      setPreviewingOutput(item)
-                      setPreviewScale(1)
-                      setPreviewOffset({ x: 0, y: 0 })
-                    }}
+                    onClick={(event) => handleOutputSelect(event, item, index)}
+                    onDoubleClick={() => openOutputPreview(item)}
                   >
                     <div className="page-preview">
                       {item.previewSrc ? (
@@ -1347,14 +2101,26 @@ function App() {
                   </button>
                   <div className="output-copy">
                     <strong>{item.label}</strong>
-                    <p>{item.detail}</p>
                   </div>
                 </article>
               ))}
+              {selectionBox && (
+                <div
+                  className="selection-box"
+                  style={{
+                    left: selectionBox.x,
+                    top: selectionBox.y,
+                    width: selectionBox.width,
+                    height: selectionBox.height,
+                  }}
+                />
+              )}
             </div>
           </section>
         </div>
         )}
+          </motion.div>
+        </AnimatePresence>
       </section>
 
       {previewingOutput && (
@@ -1371,6 +2137,7 @@ function App() {
                     if (previewingIndex > 0) {
                       setPreviewingOutput(outputCards[previewingIndex - 1])
                       setPreviewScale(1)
+                      setPreviewScaleDraft(100)
                       setPreviewOffset({ x: 0, y: 0 })
                     }
                   }}
@@ -1385,6 +2152,7 @@ function App() {
                     if (previewingIndex >= 0 && previewingIndex < outputCards.length - 1) {
                       setPreviewingOutput(outputCards[previewingIndex + 1])
                       setPreviewScale(1)
+                      setPreviewScaleDraft(100)
                       setPreviewOffset({ x: 0, y: 0 })
                     }
                   }}
@@ -1394,33 +2162,34 @@ function App() {
                 <button
                   type="button"
                   className="ghost-button compact-button"
-                  onClick={() => {
-                    const nextScale = Math.max(0.5, Number((previewScale - 0.1).toFixed(2)))
-                    setPreviewScale(nextScale)
-                    setPreviewOffset((current) => clampPreviewOffset(current.x, current.y, nextScale))
-                  }}
-                >
-                  缩小
-                </button>
-                <button
-                  type="button"
-                  className="ghost-button compact-button"
-                  onClick={() => {
-                    const nextScale = Math.min(3, Number((previewScale + 0.1).toFixed(2)))
-                    setPreviewScale(nextScale)
-                    setPreviewOffset((current) => clampPreviewOffset(current.x, current.y, nextScale))
-                  }}
-                >
-                  放大
-                </button>
-                <button
-                  type="button"
-                  className="ghost-button compact-button"
-                  disabled={previewingOutput.kind !== 'image' || !previewSrcMap[previewingOutput.id]}
+                  disabled={previewingOutput.kind !== 'image'}
                   onClick={copyPreviewImage}
                 >
                   复制图片
                 </button>
+                <label className="zoom-slider">
+                  <span>{previewScaleDraft}%</span>
+                  <input
+                    type="range"
+                    min="50"
+                    max="200"
+                    step="5"
+                    value={previewScaleDraft}
+                    onChange={(event) => {
+                      setPreviewScaleDraft(Number(event.target.value))
+                    }}
+                    onPointerUp={() => {
+                      const nextScale = previewScaleDraft / 100
+                      setPreviewScale(nextScale)
+                      setPreviewOffset((current) => clampPreviewOffset(current.x, current.y, nextScale))
+                    }}
+                    onPointerCancel={() => {
+                      const nextScale = previewScaleDraft / 100
+                      setPreviewScale(nextScale)
+                      setPreviewOffset((current) => clampPreviewOffset(current.x, current.y, nextScale))
+                    }}
+                  />
+                </label>
                 <span className="lightbox-counter">
                   {previewingIndex >= 0 ? `${previewingIndex + 1} / ${outputCards.length}` : `0 / ${outputCards.length}`}
                 </span>
@@ -1430,6 +2199,7 @@ function App() {
                   onClick={() => {
                     setPreviewingOutput(null)
                     setPreviewScale(1)
+                    setPreviewScaleDraft(100)
                     setPreviewOffset({ x: 0, y: 0 })
                   }}
                 >
@@ -1442,19 +2212,21 @@ function App() {
               className="lightbox-stage"
               onWheel={(event) => {
                 event.preventDefault()
+                event.stopPropagation()
                 const nextScale = Math.min(
-                  3,
-                  Math.max(0.5, Number((previewScale + (event.deltaY < 0 ? 0.12 : -0.12)).toFixed(2))),
+                  2,
+                  Math.max(0.5, Number((previewScale + (event.deltaY < 0 ? 0.08 : -0.08)).toFixed(2))),
                 )
                 setPreviewScale(nextScale)
+                setPreviewScaleDraft(Math.round(nextScale * 100))
                 setPreviewOffset((current) => clampPreviewOffset(current.x, current.y, nextScale))
               }}
             >
-              {previewSrcMap[previewingOutput.id] ? (
+              {previewDisplaySrc ? (
                 <img
                   ref={lightboxImageRef}
                   className="lightbox-image"
-                  src={previewSrcMap[previewingOutput.id]}
+                  src={previewDisplaySrc}
                   alt={previewingOutput.label}
                   style={{ transform: `translate(${previewOffset.x}px, ${previewOffset.y}px) scale(${previewScale})` }}
                   onDoubleClick={togglePreviewZoom}
@@ -1504,7 +2276,7 @@ function App() {
         <AnimatePresence>
           {menuOpen &&
             inactiveTools.map((tool, index) => {
-              const offset = (launcherSize + launcherGap) * (index + 1)
+              const offset = (launcherSize + launcherGap - 6) * (index + 1)
               const x = 0
               const y = stackDirection === 'up' ? -offset : offset
               const expanded = hoveredTool === tool.id
@@ -1514,18 +2286,24 @@ function App() {
                   key={tool.id}
                   type="button"
                   className={`tool-orb ${expanded ? 'is-expanded' : ''}`}
-                  initial={{ opacity: 0, scale: 0.82, x: 0, y: 0 }}
-                  animate={{ opacity: 1, scale: 1, x, y }}
-                  exit={{ opacity: 0, scale: 0.82, x: 0, y: 0 }}
-                  transition={{ type: 'spring', stiffness: 360, damping: 28, delay: index * 0.03 }}
+                  layout
+                  initial={{ opacity: 0, scale: 0.92, x: 0, y: 0, rotate: stackDirection === 'up' ? -6 : 6 }}
+                  animate={{
+                    opacity: 1,
+                    scale: expanded ? 1.08 : 1,
+                    x,
+                    y,
+                    rotate: expanded ? 0 : stackDirection === 'up' ? -2 : 2,
+                  }}
+                  exit={{ opacity: 0, scale: 0.92, x: 0, y: 0, rotate: stackDirection === 'up' ? -6 : 6 }}
+                  transition={{
+                    layout: { type: 'spring', stiffness: 500, damping: 34, mass: 0.7 },
+                    default: { type: 'spring', stiffness: 430, damping: 30, mass: 0.72, delay: index * 0.02 },
+                  }}
                   style={{ backgroundImage: tool.color }}
                   onMouseEnter={() => setHoveredTool(tool.id)}
                   onMouseLeave={() => setHoveredTool(null)}
-                  onClick={() => {
-                    setActiveTool(tool.id)
-                    setMenuOpen(false)
-                    setHoveredTool(null)
-                  }}
+                  onClick={(event) => triggerToolSwitch(tool, event)}
                 >
                   <span className="orb-icon">{tool.icon}</span>
                   <span className="orb-title">{tool.title}</span>
@@ -1537,11 +2315,18 @@ function App() {
         <motion.button
           type="button"
           className="launcher"
+          layout
           style={{ backgroundImage: currentTool.color }}
-          animate={{ scale: menuOpen ? 1.06 : 1 }}
+          animate={
+            isLauncherDragging
+              ? { scale: 1, rotate: 0 }
+              : { scale: menuOpen ? 1.03 : 1, rotate: menuOpen ? 3 : 0 }
+          }
+          transition={{ type: 'spring', stiffness: 460, damping: 32, mass: 0.72 }}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
           onClick={() => {
             if (!dragRef.current.moved) {
               setMenuOpen((open) => {
@@ -1558,6 +2343,91 @@ function App() {
           {menuOpen ? <span className="launcher-title">{currentTool.title}</span> : null}
         </motion.button>
       </div>
+
+      <AnimatePresence>
+        {toolTransition && (
+          <motion.div
+            key={toolTransition.id}
+            className="tool-transition-layer"
+            initial={{ opacity: 1 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0, transition: { duration: 0.28, ease: 'easeOut' } }}
+          >
+            <motion.div
+              className="tool-transition-orb"
+              initial={{
+                x: toolTransition.startX - launcherSize / 2,
+                y: toolTransition.startY - launcherSize / 2,
+                scale: 0.92,
+                opacity: 1,
+              }}
+              animate={{
+                x: [
+                  toolTransition.startX - launcherSize / 2,
+                  toolTransition.targetX - launcherSize / 2,
+                  toolTransition.targetX - launcherSize / 2,
+                ],
+                y: [
+                  toolTransition.startY - launcherSize / 2,
+                  toolTransition.targetY - launcherSize / 2,
+                  toolTransition.targetY - launcherSize / 2,
+                ],
+                scale: [0.92, 1.06, 0.72],
+                opacity: [1, 1, 0],
+              }}
+              transition={{
+                duration: 0.54,
+                times: [0, 0.78, 1],
+                ease: [0.2, 0.88, 0.18, 1],
+              }}
+              style={{ backgroundImage: toolTransition.tool.color }}
+            >
+              <span>{toolTransition.tool.icon}</span>
+            </motion.div>
+            <motion.div
+              className="tool-transition-pulse"
+              initial={{
+                x: toolTransition.targetX - launcherSize / 2,
+                y: toolTransition.targetY - launcherSize / 2,
+                scale: 0.72,
+                opacity: 0,
+              }}
+              animate={{ scale: [0.72, 1.28, 1.64], opacity: [0, 0.22, 0] }}
+              transition={{ duration: 0.38, delay: 0.4, ease: [0.22, 0.72, 0.18, 1] }}
+              style={{ backgroundImage: toolTransition.tool.color }}
+            />
+            <motion.div
+              className="tool-transition-wipe"
+              initial={{
+                x: toolTransition.targetX - launcherSize / 2,
+                y: toolTransition.targetY - launcherSize / 2,
+                width: launcherSize,
+                height: launcherSize,
+                borderRadius: launcherSize,
+                opacity: 0,
+              }}
+              animate={{
+                x: [
+                  toolTransition.targetX - launcherSize / 2,
+                  toolTransition.targetX - toolTransition.radius,
+                  toolTransition.targetX - toolTransition.radius,
+                ],
+                y: [
+                  toolTransition.targetY - launcherSize / 2,
+                  toolTransition.targetY - toolTransition.radius,
+                  toolTransition.targetY - toolTransition.radius,
+                ],
+                width: [launcherSize, toolTransition.radius * 2, toolTransition.radius * 2],
+                height: [launcherSize, toolTransition.radius * 2, toolTransition.radius * 2],
+                borderRadius: [launcherSize, toolTransition.radius, toolTransition.radius],
+                opacity: [0, 0.96, 0],
+              }}
+              transition={{ duration: 0.84, delay: 0.4, times: [0, 0.64, 1], ease: [0.18, 0.74, 0.2, 1] }}
+              style={{ backgroundImage: toolTransition.tool.color }}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
     </main>
   )
 }
