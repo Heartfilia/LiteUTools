@@ -13,7 +13,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { AnimatePresence, animate, motion } from 'framer-motion'
 import './App.css'
 
-type ToolId = 'convert' | 'text-compare' | 'blank-2'
+type ToolId = 'convert' | 'text-compare'
 type SourceKind = 'pdf' | 'image'
 
 type ToolDefinition = {
@@ -146,13 +146,6 @@ const tools: ToolDefinition[] = [
     subtitle: '左右粘贴两段文本，快速查看逐行差异并清空重输。',
     icon: 'TXT',
     color: 'linear-gradient(135deg, #5d8cff 0%, #8ec5ff 100%)',
-  },
-  {
-    id: 'blank-2',
-    title: '第二空白页',
-    subtitle: '专门用于测试三个工具页面之间的切换过渡和悬浮球排序效果。',
-    icon: 'ALT',
-    color: 'linear-gradient(135deg, #4eb7a8 0%, #86d7c8 100%)',
   },
 ]
 
@@ -1588,7 +1581,7 @@ function App() {
             <div className="compare-diff-shell">
               <div className="compare-editor-panel">
                 <div className="compare-editor-head">
-                  <strong>左侧文本</strong>
+                  <strong>输入内容</strong>
                   <span>{leftCompareText.length} 字符</span>
                 </div>
                 <div className="compare-editor-shell">
@@ -1610,7 +1603,7 @@ function App() {
 	                    onScroll={() => syncCompareScroll('left')}
 	                    onWheel={(event) => handleCompareWheel('left', event)}
 	                    onChange={(event) => setLeftCompareText(event.target.value)}
-                    placeholder="把第一段文本粘贴到这里..."
+                    placeholder="输入内容"
                     spellCheck={false}
                     wrap="off"
                   />
@@ -1619,7 +1612,7 @@ function App() {
 
               <div className="compare-editor-panel">
                 <div className="compare-editor-head">
-                  <strong>右侧文本</strong>
+                  <strong>输入内容</strong>
                   <span>{rightCompareText.length} 字符</span>
                 </div>
                 <div className="compare-editor-shell">
@@ -1641,21 +1634,13 @@ function App() {
 	                    onScroll={() => syncCompareScroll('right')}
 	                    onWheel={(event) => handleCompareWheel('right', event)}
 	                    onChange={(event) => setRightCompareText(event.target.value)}
-                    placeholder="把第二段文本粘贴到这里..."
+                    placeholder="输入内容"
                     spellCheck={false}
                     wrap="off"
                   />
                 </div>
               </div>
             </div>
-          </section>
-        ) : activeTool === 'blank-2' ? (
-          <section className="blank-workspace">
-            <div className="blank-orb">{currentTool.icon}</div>
-            <h3>这里是第三个工具栏目</h3>
-            <p>
-              这个页面保持空白，用来确认三个工具位之间切换时，悬浮球的排序、换位和过渡动画是否稳定。
-            </p>
           </section>
         ) : (
         <div className="workspace-grid">
