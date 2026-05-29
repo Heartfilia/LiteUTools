@@ -8,7 +8,7 @@ import {
   type WheelEvent,
 } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { AnimatePresence, animate, motion } from 'framer-motion'
 import './App.css'
@@ -190,17 +190,25 @@ async function invokeBackend<T>(command: string, payload?: Record<string, unknow
     const message = getErrorMessage(error, '调用本地命令失败')
 
     if (
-      /ipc|invoke|tauri|window.__TAURI_IPC__|not available/i.test(message)
+      /window\.__TAURI_IPC__|__TAURI_INTERNALS__|ipc channel is not available|unsupported invoke/i.test(
+        message,
+      )
     ) {
       if (error instanceof Error) {
-        throw new Error('当前启动的不是 Tauri 桌面程序，请使用 `npm run tauri:dev` 或打包后的 `.app` 启动。', {
-          cause: error,
-        })
+        throw new Error(
+          '当前启动的不是 Tauri 桌面程序，请使用 `npm run tauri:dev` 或打包后的桌面安装包启动。',
+          {
+            cause: error,
+          },
+        )
       }
 
-      throw new Error('当前启动的不是 Tauri 桌面程序，请使用 `npm run tauri:dev` 或打包后的 `.app` 启动。', {
-        cause: error,
-      })
+      throw new Error(
+        '当前启动的不是 Tauri 桌面程序，请使用 `npm run tauri:dev` 或打包后的桌面安装包启动。',
+        {
+          cause: error,
+        },
+      )
     }
 
     if (error instanceof Error) {
@@ -212,11 +220,7 @@ async function invokeBackend<T>(command: string, payload?: Record<string, unknow
 }
 
 function canUseTauriWindowApi() {
-  if (typeof window === 'undefined') {
-    return false
-  }
-
-  return '__TAURI_INTERNALS__' in window || '__TAURI__' in window
+  return typeof window !== 'undefined' && isTauri()
 }
 
 function getExtension(path: string) {
