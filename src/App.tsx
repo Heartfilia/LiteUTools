@@ -124,12 +124,21 @@ type ToolTransition = {
   radius: number
 }
 
+type CompareMode = 'line' | 'char'
+
+type DiffSegment = {
+  text: string
+  kind: 'same' | 'changed' | 'extra'
+}
+
 type DiffLine = {
   left: string
   right: string
   leftChanged: boolean
   rightChanged: boolean
   kind: 'same' | 'changed' | 'added' | 'removed'
+  leftSegments: DiffSegment[]
+  rightSegments: DiffSegment[]
 }
 
 const tools: ToolDefinition[] = [
@@ -154,6 +163,7 @@ const launcherSize = 60
 const margin = 28
 const imageExtensions = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tiff']
 const appVersion = __APP_VERSION__
+const activeToolStorageKey = 'liteutools-active-tool'
 
 function getErrorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim()) {
@@ -309,7 +319,58 @@ function buildPagePreviewName(template: string, page: number, format: PdfImageFo
   return `${fileName}.${format === 'jpg' ? 'jpg' : 'png'}`
 }
 
-function buildDiffLines(leftText: string, rightText: string): DiffLine[] {
+function buildCharSegments(leftText: string, rightText: string) {
+  const leftChars = Array.from(leftText)
+  const rightChars = Array.from(rightText)
+  const leftSegments: DiffSegment[] = []
+  const rightSegments: DiffSegment[] = []
+
+  const pushSegment = (segments: DiffSegment[], text: string, kind: DiffSegment['kind']) => {
+    if (!text) {
+      return
+    }
+
+    const last = segments[segments.length - 1]
+    if (last?.kind === kind) {
+      last.text += text
+      return
+    }
+
+    segments.push({ text, kind })
+  }
+
+  const total = Math.max(leftChars.length, rightChars.length)
+  for (let index = 0; index < total; index += 1) {
+    const leftChar = leftChars[index]
+    const rightChar = rightChars[index]
+
+    if (leftChar !== undefined && rightChar !== undefined) {
+      if (leftChar === rightChar) {
+        pushSegment(leftSegments, leftChar, 'same')
+        pushSegment(rightSegments, rightChar, 'same')
+      } else {
+        pushSegment(leftSegments, leftChar, 'changed')
+        pushSegment(rightSegments, rightChar, 'changed')
+      }
+      continue
+    }
+
+    if (leftChar !== undefined) {
+      pushSegment(leftSegments, leftChar, 'extra')
+    }
+
+    if (rightChar !== undefined) {
+      pushSegment(rightSegments, rightChar, 'extra')
+    }
+  }
+
+  return {
+    leftSegments,
+    rightSegments,
+  }
+}
+
+function buildDiffLines(leftText: string, rightText: string, compareMode: CompareMode): DiffLine[] {
   if (!leftText && !rightText) {
     return []
   }
@@ -327,12 +388,15 @@ function buildDiffLines(leftText: string, rightText: string): DiffLine[] {
 
     if (hasLeft && hasRight) {
       const changed = left !== right
+      const segments = compareMode === 'char' ? buildCharSegments(left, right) : null
       lines.push({
         left,
         right,
-        leftChanged: changed,
-        rightChanged: changed,
+        leftChanged: compareMode === 'line' && changed,
+        rightChanged: compareMode === 'line' && changed,
         kind: changed ? 'changed' : 'same',
+        leftSegments: segments?.leftSegments ?? [{ text: left, kind: 'same' }],
+        rightSegments: segments?.rightSegments ?? [{ text: right, kind: 'same' }],
       })
       continue
     }
@@ -341,9 +405,12 @@ function buildDiffLines(leftText: string, rightText: string): DiffLine[] {
       lines.push({
         left,
         right: '',
-        leftChanged: true,
+        leftChanged: compareMode === 'line',
         rightChanged: false,
         kind: 'removed',
+        leftSegments:
+          compareMode === 'char' ? [{ text: left, kind: 'extra' }] : [{ text: left, kind: 'same' }],
+        rightSegments: [],
       })
       continue
     }
@@ -352,12 +419,39 @@ function buildDiffLines(leftText: string, rightText: string): DiffLine[] {
       left: '',
       right,
       leftChanged: false,
-      rightChanged: true,
+      rightChanged: compareMode === 'line',
       kind: 'added',
+      leftSegments: [],
+      rightSegments:
+        compareMode === 'char' ? [{ text: right, kind: 'extra' }] : [{ text: right, kind: 'same' }],
     })
   }
 
   return lines
+}
+
+function renderDiffSegments(segments: DiffSegment[], fallbackText: string) {
+  if (!segments.length) {
+    return fallbackText || ' '
+  }
+
+  return segments.map((segment, index) => (
+    <span
+      key={`${segment.kind}-${index}-${segment.text}`}
+      className={segment.kind === 'same' ? undefined : `compare-char-segment compare-char-${segment.kind}`}
+    >
+      {segment.text || ' '}
+    </span>
+  ))
+}
+
+function getInitialActiveTool(): ToolId {
+  if (typeof window === 'undefined') {
+    return 'convert'
+  }
+
+  const saved = window.localStorage.getItem(activeToolStorageKey)
+  return saved === 'text-compare' ? 'text-compare' : 'convert'
 }
 
 function getCornerFromAnchor(anchor: { x: number; y: number }) {
@@ -367,7 +461,7 @@ function getCornerFromAnchor(anchor: { x: number; y: number }) {
 }
 
 function App() {
-  const [activeTool, setActiveTool] = useState<ToolId>('convert')
+  const [activeTool, setActiveTool] = useState<ToolId>(() => getInitialActiveTool())
   const [menuOpen, setMenuOpen] = useState(false)
   const [hoveredTool, setHoveredTool] = useState<ToolId | null>(null)
   const [sources, setSources] = useState<SourceItem[]>([])
@@ -385,6 +479,7 @@ function App() {
   const [imageParamsEnabled, setImageParamsEnabled] = useState(false)
   const [leftCompareText, setLeftCompareText] = useState('')
   const [rightCompareText, setRightCompareText] = useState('')
+  const [compareMode, setCompareMode] = useState<CompareMode>('line')
   const [pdfImageParams, setPdfImageParams] = useState<PdfImageParams>({
     format: 'png',
     quality: 'standard',
@@ -548,8 +643,8 @@ function App() {
     ? fullPreviewSrcMap[previewingOutput.id] || previewSrcMap[previewingOutput.id]
     : ''
   const diffLines = useMemo(
-    () => buildDiffLines(leftCompareText, rightCompareText),
-    [leftCompareText, rightCompareText],
+    () => buildDiffLines(leftCompareText, rightCompareText, compareMode),
+    [compareMode, leftCompareText, rightCompareText],
   )
   const diffSummary = useMemo(
     () => ({
@@ -700,6 +795,14 @@ function App() {
     window.addEventListener('resize', updateAnchor)
     return () => window.removeEventListener('resize', updateAnchor)
   }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+
+    window.localStorage.setItem(activeToolStorageKey, activeTool)
+  }, [activeTool])
 
   useEffect(() => {
     const clearSession = () => {
@@ -1556,6 +1659,23 @@ function App() {
 	                <span>新增 {diffSummary.added}</span>
 	                <span>删除 {diffSummary.removed}</span>
 	              </div>
+                <div className="compare-toolbar-actions">
+                  <div className="compare-mode-switch" aria-label="对比模式">
+                    <button
+                      type="button"
+                      className={`compare-mode-button ${compareMode === 'line' ? 'is-active' : ''}`}
+                      onClick={() => setCompareMode('line')}
+                    >
+                      逐行
+                    </button>
+                    <button
+                      type="button"
+                      className={`compare-mode-button ${compareMode === 'char' ? 'is-active' : ''}`}
+                      onClick={() => setCompareMode('char')}
+                    >
+                      逐字
+                    </button>
+                  </div>
 	              <button
                 type="button"
                 className="clear-compare-button"
@@ -1580,12 +1700,13 @@ function App() {
               >
                 清屏
               </button>
+                </div>
             </div>
 
             <div className="compare-diff-shell">
               <div className="compare-editor-panel">
                 <div className="compare-editor-head">
-                  <strong>输入内容</strong>
+                  <strong>输入区</strong>
                   <span>{leftCompareText.length} 字符</span>
                 </div>
                 <div className="compare-editor-shell">
@@ -1596,7 +1717,7 @@ function App() {
                         className={`compare-line compare-line-${line.kind} ${line.leftChanged ? 'is-changed' : ''}`}
                       >
                         <span className="compare-line-number">{index + 1}</span>
-                        <code>{line.left || ' '}</code>
+                        <code>{renderDiffSegments(line.leftSegments, line.left)}</code>
                       </div>
                     ))}
                   </div>
@@ -1607,7 +1728,7 @@ function App() {
 	                    onScroll={() => syncCompareScroll('left')}
 	                    onWheel={(event) => handleCompareWheel('left', event)}
 	                    onChange={(event) => setLeftCompareText(event.target.value)}
-                    placeholder="输入内容"
+                    placeholder="请输入文本..."
                     spellCheck={false}
                     wrap="off"
                   />
@@ -1616,7 +1737,7 @@ function App() {
 
               <div className="compare-editor-panel">
                 <div className="compare-editor-head">
-                  <strong>输入内容</strong>
+                  <strong>输入区</strong>
                   <span>{rightCompareText.length} 字符</span>
                 </div>
                 <div className="compare-editor-shell">
@@ -1627,7 +1748,7 @@ function App() {
                         className={`compare-line compare-line-${line.kind} ${line.rightChanged ? 'is-changed' : ''}`}
                       >
                         <span className="compare-line-number">{index + 1}</span>
-                        <code>{line.right || ' '}</code>
+                        <code>{renderDiffSegments(line.rightSegments, line.right)}</code>
                       </div>
                     ))}
                   </div>
@@ -1638,7 +1759,7 @@ function App() {
 	                    onScroll={() => syncCompareScroll('right')}
 	                    onWheel={(event) => handleCompareWheel('right', event)}
 	                    onChange={(event) => setRightCompareText(event.target.value)}
-                    placeholder="输入内容"
+                    placeholder="请输入文本..."
                     spellCheck={false}
                     wrap="off"
                   />

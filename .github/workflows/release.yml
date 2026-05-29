@@ -61,7 +61,7 @@ jobs:
         run: npm run pdfium:setup
 
       - name: Import Apple Developer Certificate
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE != ''
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
