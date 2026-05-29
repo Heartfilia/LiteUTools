@@ -11,6 +11,7 @@
     "pdfium:setup": "node scripts/setup-pdfium.mjs",
     "pdfium:check": "node scripts/setup-pdfium.mjs --check",
     "version:sync": "node scripts/sync-version.mjs",
+    "tauri": "tauri",
     "tauri:dev": "npm run pdfium:setup && tauri dev",
     "tauri:build": "npm run pdfium:setup && tauri build"
   },
