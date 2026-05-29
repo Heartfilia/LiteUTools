@@ -22,6 +22,9 @@ jobs:
             args: --bundles nsis
 
     runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_HTTP_MULTIPLEXING: false
 
     steps:
       - name: Checkout
@@ -35,6 +38,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -60,33 +68,10 @@ jobs:
       - name: Download Pdfium resources
         run: npm run pdfium:setup
 
-      - name: Import Apple Developer Certificate
-        if: runner.os == 'macOS' && vars.ENABLE_MACOS_SIGNING == 'true' && env.APPLE_CERTIFICATE != ''
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          security find-identity -v -p codesigning build.keychain
-
       - name: Build Tauri bundles and attach to release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          KEYCHAIN_PASSWORD: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.KEYCHAIN_PASSWORD || '' }}
-          APPLE_SIGNING_IDENTITY: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_ID: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && secrets.APPLE_TEAM_ID || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: LiteUtools ${{ github.ref_name }}
